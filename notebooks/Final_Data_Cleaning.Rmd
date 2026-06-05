@@ -1,0 +1,147 @@
+---
+title: "Final Data Cleaning Submission"
+author: "Sore Ajagbe"
+date: "2026-06-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse) 
+library(janitor)   
+library(skimr)      
+library(lubridate)
+library(ggcorrplot)
+library(imputeTS)
+library(reshape2)
+library(ggtext)
+```
+
+```{r}
+file_path <- "../data/turingAI_forecasting_challenge_dataset.csv"
+file_path_2 <- "../data/ukhsa-influenza.csv"
+
+dat1 <- read_csv(file_path)
+dat_resp <- read_csv(file_path_2)
+```
+
+```{r}
+# Standardize Dates and Times
+dat2 <- dat1 %>%
+  mutate(
+    dt = as.POSIXct(dt, tz = "UTC"),
+    date_only = as.Date(dt),
+    
+    # If recorded after midday, attribute to the next day's operational cycle
+    # State of the ED midday influences harm that evening
+    # Compliance with challenge rules
+    operational_day = if_else(format(dt, "%H:%M:%S") > "12:00:00", 
+                              date_only + 1, date_only)
+  ) %>%
+  filter(operational_day >= as.Date("2023-03-16") & 
+         operational_day <= as.Date("2025-09-30"))
+```
+
+```{r}
+# Audit every metric to see completeness (I assumed 930 days but some have more)
+metric_audit <- dat2 %>%
+  group_by(metric_name) %>%
+  summarise(
+    days_present = n_distinct(operational_day),
+    completeness = (days_present / 930) * 100
+  )
+
+# Define 80% threshold of completeness
+keep_metrics <- metric_audit %>%
+  filter(completeness >= 80) %>%
+  pull(metric_name)
+```
+
+```{r}
+# Since some days contain shorter time intervals, we average all to 1 day
+dat3 <- dat2 %>%
+  group_by(operational_day, metric_name, coverage) %>%
+  summarise(
+    daily_value = mean(value, na.rm = TRUE), 
+    .groups = "drop"
+  )
+```
+
+```{r}
+# This creates the wide-format table where each column is a unique metric
+dat4 <- dat3 %>%
+ 
+  # Combine Site and Metric name to create unique column headers
+  mutate(column_label = paste0(coverage, "_", metric_name)) %>%
+  select(operational_day, column_label, daily_value) %>%
+  pivot_wider(names_from = column_label, values_from = daily_value)
+
+# Ensure the dates are in chronological order
+dat4 <- dat4 %>% arrange(operational_day)
+```
+
+```{r}
+# Calculate the percentage of missing values for every column
+missing_pct <- colMeans(is.na(dat4)) * 100
+
+# Columns with less than 40% missing data 
+keep_cols <- names(missing_pct[missing_pct < 40])
+dat5 <- dat4[, keep_cols]
+```
+
+```{r}
+# Separate imputation logic
+dat6 <- dat5 %>%
+  
+  # Use linear for operational metrics (like occupancy/waiting times)
+  mutate(across(where(is.numeric) & !estimated_avoidable_deaths, 
+                ~na_interpolation(., option = "linear"))) %>%
+  
+  # Use LOCF or 0 for the target to prevent negative values
+  mutate(estimated_avoidable_deaths = na_locf(estimated_avoidable_deaths, na_remaining = "rev")) %>%
+  mutate(estimated_avoidable_deaths = pmax(0, estimated_avoidable_deaths))
+```
+
+```{r}
+# Filtering heuristic to reduce dimensionality
+keywords <- c("Total", "Aggregated", "Mean", "OPEL", "occupancy", 
+              "estimated_avoidable_deaths", "operational_day", 
+              "12 hours", "60mins", "Queue")
+
+# Define specific extra metrics to include
+extra_metrics <- c(
+  "SWASFT_(SWASFT) Number of HCP Incidents",
+  "SevernSide_(Severnside) Calls Answered",
+  "BRI_Number of Admissions",
+  "NBT_Number of Admissions",
+  "WGH_Number of Admissions"
+)
+
+# Filter columns based on keywords or exact matches in extra_metrics
+dat7 <- dat6 %>%
+  select(any_of(extra_metrics), matches(paste(keywords, collapse = "|"))) %>%
+  relocate(operational_day, estimated_avoidable_deaths)
+```
+
+```{r}
+dat_resp <- dat_resp %>%
+  mutate(date = as.Date(parse_date_time(date, orders = c("ymd", "dmy", "mdy"))))
+
+dat8 <- dat7 %>%
+  left_join(dat_resp %>% select(date, metric_value), 
+            by = c("operational_day" = "date"))
+dat8$metric_value <- zoo::na.locf(dat8$metric_value, fromLast = TRUE, na.rm = FALSE)
+
+dat8 <- dat8 %>%
+  rename(ICU_admissions = metric_value)
+
+dat8 <- dat8 %>%
+  mutate(ICU_admissions = ICU_admissions * 100000)
+```
+
+```{r}
+write.csv(dat8, "modeldat.csv", row.names = FALSE)
+```
